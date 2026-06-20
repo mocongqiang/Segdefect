@@ -1,0 +1,25 @@
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 数据集（torchvision 自动下载）
+data/
+
+# 训练产物
+*.model
+*.log
+*.pth
+*.pt
+*.csv
+*.json
+log.txt
+tra.py
+
+# OS
+.DS_Store
+Thumbs.db
