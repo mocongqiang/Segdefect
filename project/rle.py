@@ -1,4 +1,5 @@
 """RLE 编解码 (行优先, 1-indexed)"""
+import os
 import numpy as np
 from config import cfg
 
@@ -57,7 +58,7 @@ def generate_submission(test_predictions, test_names, output_path):
     rows = []
     for pred, name in zip(test_predictions, test_names):
         # 从文件名提取 id, 如 'test_0001.png' -> 'test_0001'
-        img_id = name.replace('.png', '')
+        img_id = os.path.splitext(name)[0]
         for cls in cfg.defect_classes:   # 1=Oil, 2=Stain, 3=Scratch
             binary = (pred == cls).astype(np.uint8)
             rle = encode_rle(binary)

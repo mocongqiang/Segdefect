@@ -19,7 +19,7 @@ def main():
     model = build_model().to(device)
     ckpt_path = os.path.join(cfg.ckpt_dir, 'best.pth')
     print(f'Loading checkpoint: {ckpt_path}')
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model_state'])
     model.eval()
 
@@ -49,6 +49,7 @@ def main():
             device=device,
             tta=cfg.tta_flips,
             num_classes=cfg.num_classes,
+            has_cls=True,        # 模型返回 (seg, cls)，滑窗自动解包
         )   # (H, W, C)
 
         pred = prob_map.argmax(axis=2).astype(np.uint8)   # (H, W)

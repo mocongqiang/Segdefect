@@ -84,14 +84,16 @@ class CombinedLoss(nn.Module):
         self.focal  = FocalLoss(alpha=cfg.class_weights, gamma=2.0)
         self.dice   = DiceLoss()
         self.lovasz = LovaszSoftmax()
+        self.bce    = nn.BCEWithLogitsLoss()   # 多标签分类
         self.epoch  = 0
 
     def set_epoch(self, epoch):
         self.epoch = epoch
 
-    def forward(self, logits, target):
-        loss = cfg.w_focal * self.focal(logits, target) \
-             + cfg.w_dice  * self.dice(logits, target)
+    def forward(self, seg_logits, cls_logits, target, cls_target):
+        loss = cfg.w_focal * self.focal(seg_logits, target) \
+             + cfg.w_dice  * self.dice(seg_logits, target)
         if self.epoch >= 5:
-            loss += cfg.w_lovasz * self.lovasz(logits, target)
+            loss += cfg.w_lovasz * self.lovasz(seg_logits, target)
+        loss += cfg.w_cls * self.bce(cls_logits, cls_target)
         return loss

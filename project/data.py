@@ -67,7 +67,7 @@ def get_split():
     train_idx = indices[n_val:]
 
     def to_pair(p):
-        name = os.path.splitext(os.path.basename(p))[0] + '.png'
+        name = os.path.basename(p).replace('.jpg', '.png')
         mp = os.path.join(cfg.train_mask, name)
         return (p, mp)
 

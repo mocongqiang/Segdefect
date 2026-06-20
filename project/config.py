@@ -6,13 +6,15 @@ os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 
 class Config:
     # ===================== 路径 =====================
-    data_root   = '../data'
+    _proj_dir   = os.path.dirname(os.path.abspath(__file__))
+    _root       = os.path.dirname(_proj_dir)          # Segdefect/
+    data_root   = os.path.join(_root, 'data')
     train_img   = os.path.join(data_root, 'train/images')
     train_mask  = os.path.join(data_root, 'train/masks')
     test_img    = os.path.join(data_root, 'test/images')
     sample_sub  = os.path.join(data_root, 'sample_submission.csv')
 
-    out_root    = '../output'
+    out_root    = os.path.join(_root, 'output')
     ckpt_dir    = os.path.join(out_root, 'checkpoints')
     log_dir     = os.path.join(out_root, 'logs')
     sub_dir     = os.path.join(out_root, 'submissions')
@@ -54,13 +56,14 @@ class Config:
     w_focal  = 0.4
     w_dice   = 0.3
     w_lovasz = 0.3          # epoch >= 5 才启用（修复 Lovasz 实现后提前）
+    w_cls = 0.1             # 分类损失权重（辅助任务）
 
     # 类别权重 (BG, Oil, Stain, Scratch)
     class_weights = [0.1, 1.0, 5.0, 3.0]
 
     # Early Stopping（Epoch 28 后持续过拟合，Loss 已失能）
     early_stop_patience = 15         # 15 epoch mIoU 不涨就停
-    early_stop_min_delta = 0.001     
+    early_stop_min_delta = 0.001
 
     # EMA
     ema_decay = 0.999

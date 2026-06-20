@@ -49,17 +49,18 @@ def get_lr_scheduler(optimizer, epochs, warmup_epochs):
 
 @torch.no_grad()
 def sliding_window_inference(model, image, crop_size, overlap, device,
-                             tta=True, num_classes=4):
+                             tta=True, num_classes=4, has_cls=False):
     """滑窗推理, 支持 TTA。
 
     Args:
-        model: 分割模型
+        model: 分割模型 (如果 has_cls=True, 返回 (seg_logits, cls_logits))
         image: (1, 3, H, W) tensor
         crop_size: int
         overlap: int
         device: torch.device
         tta: bool, 是否使用翻转 TTA
         num_classes: int
+        has_cls: bool, 模型是否返回分类输出
 
     Returns:
         prob_map: (H, W, C) numpy array, softmax 概率
@@ -107,8 +108,9 @@ def sliding_window_inference(model, image, crop_size, overlap, device,
                 if vflip:
                     p = torch.flip(p, dims=[2])
 
-                logits = model(p)
-                prob = F.softmax(logits, dim=1)   # (1,C,cs,cs)
+                out = model(p)
+                seg_logits = out[0] if has_cls else out
+                prob = F.softmax(seg_logits, dim=1)   # (1,C,cs,cs)
 
                 if hflip:
                     prob = torch.flip(prob, dims=[3])

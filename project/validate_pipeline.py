@@ -75,7 +75,8 @@ def evaluate_sliding(model, loader, device, metric):
                 prob = sliding_window_inference(
                     model, single_img, crop_size=cfg.infer_crop,
                     overlap=cfg.infer_overlap, device=device,
-                    tta=False, num_classes=cfg.num_classes)
+                    tta=False, num_classes=cfg.num_classes,
+                    has_cls=True)
                 pred = torch.from_numpy(prob.argmax(axis=2)).unsqueeze(0).to(device)
                 metric.update(pred, masks[i:i+1])
     return metric.compute()
@@ -93,8 +94,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, ema):
     for step, (imgs, masks) in enumerate(pbar):
         imgs  = imgs.to(device)
         masks = masks.to(device)
-        logits = model(imgs)
-        loss = criterion(logits, masks) / accum
+        seg_logits, cls_logits = model(imgs)
+        cls_target = (masks.unsqueeze(1) == torch.tensor([1,2,3], device=device).view(1,3,1,1)).any(dim=(2,3)).float()
+        loss = criterion(seg_logits, cls_logits, masks, cls_target) / accum
         loss.backward()
         if (step + 1) % accum == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -216,7 +218,8 @@ def main():
         prob = sliding_window_inference(
             model, img_t, crop_size=cfg.infer_crop,
             overlap=cfg.infer_overlap, device=device,
-            tta=cfg.tta_flips, num_classes=cfg.num_classes)
+            tta=cfg.tta_flips, num_classes=cfg.num_classes,
+            has_cls=True)
         predictions.append(prob.argmax(axis=2).astype(np.uint8))
         names.append(name)
 

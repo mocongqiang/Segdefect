@@ -27,16 +27,29 @@ from metrics import IoUMetric
 from utils import set_seed, EMA, get_lr_scheduler
 from logger import TrainLogger
 
+
+def make_cls_target(masks):
+    """从 mask 生成多标签分类目标 (B, 3)。
+
+    cls_target[i] = [has_oil, has_stain, has_scratch]
+    """
+    B = masks.shape[0]
+    targets = masks.new_zeros(B, 3)
+    for c in [1, 2, 3]:
+        targets[:, c - 1] = (masks == c).flatten(1).any(dim=1).float()
+    return targets
+
+
 def evaluate(model, loader, device, metric):
-    """验证：val_transform 已 pad 到 32 倍数，直接 forward 即可。"""
+    """验证：模型返回 (seg_logits, cls_logits)，只用 seg_logits 计算 mIoU。"""
     model.eval()
     metric.reset()
     with torch.no_grad():
         for imgs, masks in tqdm(loader, desc='Val', leave=False):
             imgs  = imgs.to(device)
             masks = masks.to(device)
-            logits = model(imgs)
-            pred = logits.argmax(dim=1)
+            seg_logits, _ = model(imgs)
+            pred = seg_logits.argmax(dim=1)
             metric.update(pred, masks)
     return metric.compute()
 
@@ -56,8 +69,9 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler,
         masks = masks.to(device, non_blocking=True)
 
         with autocast('cuda', enabled=cfg.amp):
-            logits = model(imgs)
-            loss = criterion(logits, masks) / accum_steps
+            seg_logits, cls_logits = model(imgs)
+            cls_target = make_cls_target(masks)
+            loss = criterion(seg_logits, cls_logits, masks, cls_target) / accum_steps
 
         scaler.scale(loss).backward()
 
