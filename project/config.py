@@ -68,6 +68,10 @@ class Config:
     # EMA
     ema_decay = 0.999
 
+    # 断点续训: 设为 checkpoint 路径, 如 '../output/checkpoints/epoch_20.pth'
+    # 留空或 None 表示从头训练
+    resume_from = None
+
     # CopyPaste
     copypaste_prob = 0.3
 

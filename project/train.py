@@ -6,7 +6,7 @@
 本地快速验证：
   运行：python validate_pipeline.py
 """
-import os, sys, time, copy
+import os, sys, time, copy, shutil
 
 # 减少 CUDA 内存碎片（OOM 时推荐开启）
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
@@ -34,7 +34,7 @@ def make_cls_target(masks):
     cls_target[i] = [has_oil, has_stain, has_scratch]
     """
     B = masks.shape[0]
-    targets = masks.new_zeros(B, 3)
+    targets = masks.new_zeros(B, 3, dtype=torch.float)
     for c in [1, 2, 3]:
         targets[:, c - 1] = (masks == c).flatten(1).any(dim=1).float()
     return targets
@@ -137,16 +137,52 @@ def main():
     # ---------- EMA ----------
     ema = EMA(model, decay=cfg.ema_decay)
 
+    # ---------- 断点续训 ----------
+    best_miou = 0.0
+    best_epoch = 0
+    early_stop_counter = 0
+    start_epoch = 0
+
+    if cfg.resume_from and os.path.exists(cfg.resume_from):
+        print(f'Resuming from: {cfg.resume_from}')
+
+        # 备份上一轮的 best.pth，防止被续训覆盖
+        best_path = os.path.join(cfg.ckpt_dir, 'best.pth')
+        if os.path.exists(best_path):
+            backup_path = os.path.join(cfg.ckpt_dir, f'best_backup_epoch00.pth')
+            ckpt_old = torch.load(best_path, map_location='cpu', weights_only=False)
+            old_epoch = ckpt_old.get('epoch', -1) + 1
+            backup_path = os.path.join(cfg.ckpt_dir, f'best_backup_epoch{old_epoch}.pth')
+            shutil.copy2(best_path, backup_path)
+            print(f'  Backed up previous best → {backup_path}')
+
+        ckpt = torch.load(cfg.resume_from, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scaler' in ckpt:
+            scaler.load_state_dict(ckpt['scaler'])
+        if 'ema_shadow' in ckpt:
+            ema.shadow = ckpt['ema_shadow']
+        best_miou = ckpt.get('best_miou', 0.0)
+        best_epoch = ckpt.get('best_epoch', 0)
+        early_stop_counter = ckpt.get('early_stop_counter', 0)
+        start_epoch = ckpt['epoch'] + 1
+        # 用新 cfg.epochs 重建 scheduler，并跳过已训练 epoch
+        scheduler = get_lr_scheduler(optimizer, cfg.epochs, cfg.warmup_epochs)
+        for _ in range(start_epoch):
+            scheduler.step()
+        remaining = cfg.epochs - start_epoch
+        print(f'  Resumed at epoch {start_epoch+1}, {remaining} epochs remaining')
+        print(f'  Best so far: mIoU={best_miou:.4f} at epoch {best_epoch+1}')
+        print(f'  Early stop counter: {early_stop_counter}/{cfg.early_stop_patience}')
+
     # ---------- 日志 ----------
     logger = TrainLogger(cfg, tag='train')
 
     # ---------- 训练循环 ----------
-    best_miou = 0.0
-    best_epoch = 0
-    early_stop_counter = 0
     metric = IoUMetric(num_classes=cfg.num_classes)
 
-    for epoch in range(cfg.epochs):
+    for epoch in range(start_epoch, cfg.epochs):
         # 训练
         avg_loss = train_one_epoch(model, train_loader, criterion,
                                    optimizer, scaler, device, epoch, ema)
@@ -188,12 +224,17 @@ def main():
                   f'(Best: {best_miou:.4f} at epoch {best_epoch+1})')
             break
 
-        # 每 20 epoch 存 checkpoint
-        if (epoch + 1) % 20 == 0:
+        # 每 10 epoch 存 checkpoint（含完整训练状态，支持断点续训）
+        if (epoch + 1) % 10 == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
+                'ema_shadow': copy.deepcopy(ema.shadow),
+                'best_miou': best_miou,
+                'best_epoch': best_epoch,
+                'early_stop_counter': early_stop_counter,
             }, os.path.join(cfg.ckpt_dir, f'epoch_{epoch+1}.pth'))
 
     logger.close()
