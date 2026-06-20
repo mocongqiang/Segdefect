@@ -85,6 +85,7 @@ class Config:
     infer_crop    = 1024              # validate_pipeline.py 会覆盖为 512
     infer_overlap = 256               # validate_pipeline.py 会覆盖为 128
     tta_flips     = True       # hflip + vflip
+    tta_scales    = [0.75, 1.0, 1.25]  # 多尺度 TTA, 1.0=原图
 
     # ===================== RLE =====================
     rle_index_start = 1        # 像素编号从 1 开始

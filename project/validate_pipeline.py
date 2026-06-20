@@ -24,6 +24,7 @@ cfg.amp              = False
 cfg.encoder          = 'timm-efficientnet-b1'          # 轻量编码器, 速度 3x
 cfg.infer_crop       = 512                            # 验证/推理用 crop, 与训练一致
 cfg.infer_overlap    = 128
+cfg.tta_scales       = [1.0]                     # 快速验证: 只用原图, 不加多尺度
 # ----------------------------------
 
 os.environ.pop('PYTORCH_CUDA_ALLOC_CONF', None)
@@ -76,7 +77,7 @@ def evaluate_sliding(model, loader, device, metric):
                     model, single_img, crop_size=cfg.infer_crop,
                     overlap=cfg.infer_overlap, device=device,
                     tta=False, num_classes=cfg.num_classes,
-                    has_cls=True)
+                    has_cls=True, scales=[1.0])
                 pred = torch.from_numpy(prob.argmax(axis=2)).unsqueeze(0).to(device)
                 metric.update(pred, masks[i:i+1])
     return metric.compute()
@@ -219,7 +220,7 @@ def main():
             model, img_t, crop_size=cfg.infer_crop,
             overlap=cfg.infer_overlap, device=device,
             tta=cfg.tta_flips, num_classes=cfg.num_classes,
-            has_cls=True)
+            has_cls=True, scales=cfg.tta_scales)
         predictions.append(prob.argmax(axis=2).astype(np.uint8))
         names.append(name)
 

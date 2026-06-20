@@ -41,7 +41,7 @@ def main():
         augmented = t(image=img)
         img_tensor = augmented['image'].unsqueeze(0).to(device)  # (1,3,H,W)
 
-        # 滑窗推理
+        # 滑窗推理（含多尺度 TTA）
         prob_map = sliding_window_inference(
             model, img_tensor,
             crop_size=cfg.infer_crop,
@@ -50,6 +50,7 @@ def main():
             tta=cfg.tta_flips,
             num_classes=cfg.num_classes,
             has_cls=True,        # 模型返回 (seg, cls)，滑窗自动解包
+            scales=cfg.tta_scales,  # 多尺度 TTA
         )   # (H, W, C)
 
         pred = prob_map.argmax(axis=2).astype(np.uint8)   # (H, W)

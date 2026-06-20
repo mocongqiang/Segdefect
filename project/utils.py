@@ -49,8 +49,9 @@ def get_lr_scheduler(optimizer, epochs, warmup_epochs):
 
 @torch.no_grad()
 def sliding_window_inference(model, image, crop_size, overlap, device,
-                             tta=True, num_classes=4, has_cls=False):
-    """滑窗推理, 支持 TTA。
+                             tta=True, num_classes=4, has_cls=False,
+                             scales=None):
+    """滑窗推理, 支持翻转 TTA + 多尺度 TTA。
 
     Args:
         model: 分割模型 (如果 has_cls=True, 返回 (seg_logits, cls_logits))
@@ -61,9 +62,54 @@ def sliding_window_inference(model, image, crop_size, overlap, device,
         tta: bool, 是否使用翻转 TTA
         num_classes: int
         has_cls: bool, 模型是否返回分类输出
+        scales: list[float] | None, 多尺度因子, 如 [0.75, 1.0, 1.25], None 等价于 [1.0]
 
     Returns:
         prob_map: (H, W, C) numpy array, softmax 概率
+    """
+    scales = scales or [1.0]
+    _, _, H, W = image.shape
+    prob_sum = torch.zeros(H, W, num_classes, device=device)
+    count_sum = torch.zeros(H, W, 1, device=device)
+
+    for scale in scales:
+        # ── 缩放图像 ──
+        if scale == 1.0:
+            scaled_img = image
+        else:
+            new_h, new_w = int(round(H * scale)), int(round(W * scale))
+            scaled_img = F.interpolate(image, size=(new_h, new_w),
+                                       mode='bilinear', align_corners=False)
+
+        # ── 单尺度滑窗+翻转 TTA ──
+        prob_map_scaled = _single_scale_inference(
+            model, scaled_img, crop_size, overlap, device,
+            tta=tta, num_classes=num_classes, has_cls=has_cls,
+        )  # (scale_h, scale_w, C) numpy
+
+        # ── 缩回原图尺寸 ──
+        prob_t = torch.from_numpy(prob_map_scaled).permute(2, 0, 1).unsqueeze(0).to(device)  # (1,C,H_s,W_s)
+        prob_t = F.interpolate(prob_t, size=(H, W), mode='bilinear',
+                               align_corners=False)  # (1,C,H,W)
+        prob_t = prob_t[0].permute(1, 2, 0)  # (H,W,C)
+        prob_sum += prob_t
+        count_sum += 1.0
+
+    prob_map = (prob_sum / count_sum).cpu().numpy()   # (H,W,C)
+    return prob_map
+
+
+@torch.no_grad()
+def _single_scale_inference(model, image, crop_size, overlap, device,
+                            tta=True, num_classes=4, has_cls=False):
+    """单尺度滑窗推理 (含翻转 TTA)。
+
+    Args:
+        image: (1, 3, H, W) tensor
+    其余参数同 sliding_window_inference。
+
+    Returns:
+        prob_map: (H, W, C) numpy array
     """
     _, _, H, W = image.shape
     stride = crop_size - overlap
