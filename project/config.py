@@ -53,13 +53,14 @@ class Config:
     amp           = True              # 同左
 
     # 损失权重
-    w_focal  = 0.4
-    w_dice   = 0.3
-    w_lovasz = 0.3          # epoch >= 5 才启用（修复 Lovasz 实现后提前）
-    w_cls = 0.1             # 分类损失权重（辅助任务）
+    w_focal  = 0.5
+    w_dice   = 0.5          # Dice 权重提高，对缺陷类更敏感
+    w_lovasz = 0.0          # 暂时禁用
+    w_cls = 0.0             # 暂时禁用分类头
 
     # 类别权重 (BG, Oil, Stain, Scratch)
-    class_weights = [0.1, 1.0, 5.0, 3.0]
+    # BG 极低权重防止模型退化为全 BG 预测
+    class_weights = [0.0001, 1.0, 20.0, 10.0]
 
     # Early Stopping（Epoch 28 后持续过拟合，Loss 已失能）
     early_stop_patience = 15         # 15 epoch mIoU 不涨就停
@@ -73,11 +74,11 @@ class Config:
     resume_from = None
 
     # CopyPaste
-    copypaste_prob = 0.3
+    copypaste_prob = 0.5
 
     # ===================== 模型 =====================
     arch            = 'DeepLabV3Plus'
-    encoder         = 'timm-efficientnet-b5'
+    encoder         = 'resnet50'
     encoder_weights = 'imagenet'
 
     # ===================== 推理 =====================

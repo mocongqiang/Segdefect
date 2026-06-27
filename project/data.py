@@ -216,23 +216,37 @@ def get_train_transform(crop_size):
     ], additional_targets={'mask': 'mask'})
 
 
-def _pad_to_divisor(img, mask=None, divisor=32):
-    """将图像 (和 mask) pad 到 divisor 的倍数 (右下侧补零)。"""
+def _pad_to_divisor(img, mask=None, divisor=32, return_pad=False):
+    """将图像 (和 mask) pad 到 divisor 的倍数 (右下侧补零)。
+
+    Args:
+        return_pad: 如果为 True，额外返回 (pad_h, pad_w) 用于后续裁剪
+    """
     h, w = img.shape[:2]
     pad_h = (divisor - h % divisor) % divisor
     pad_w = (divisor - w % divisor) % divisor
+
     if pad_h == 0 and pad_w == 0:
+        if return_pad:
+            return (img, mask, 0, 0) if mask is not None else (img, 0, 0)
         return (img, mask) if mask is not None else img
+
     if img.ndim == 3:
         img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)),
                      mode='constant', constant_values=0)
     else:
         img = np.pad(img, ((0, pad_h), (0, pad_w)),
                      mode='constant', constant_values=0)
+
     if mask is not None:
         mask = np.pad(mask, ((0, pad_h), (0, pad_w)),
                       mode='constant', constant_values=0)
+        if return_pad:
+            return img, mask, pad_h, pad_w
         return img, mask
+
+    if return_pad:
+        return img, pad_h, pad_w
     return img
 
 

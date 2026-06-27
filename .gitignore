@@ -9,6 +9,7 @@ __pycache__/
 
 # 数据集（torchvision 自动下载）
 data/
+pay/
 
 # 训练产物
 *.model
@@ -23,3 +24,4 @@ tra.py
 # OS
 .DS_Store
 Thumbs.db
+

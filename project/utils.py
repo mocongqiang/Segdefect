@@ -155,7 +155,7 @@ def _single_scale_inference(model, image, crop_size, overlap, device,
                     p = torch.flip(p, dims=[2])
 
                 out = model(p)
-                seg_logits = out[0] if has_cls else out
+                seg_logits = out[0] if has_cls and isinstance(out, (tuple, list)) else out
                 prob = F.softmax(seg_logits, dim=1)   # (1,C,cs,cs)
 
                 if hflip:

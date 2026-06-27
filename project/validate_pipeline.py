@@ -15,13 +15,13 @@ from tqdm import tqdm
 # ---- 临时覆盖配置：快速验证用 ----
 from config import cfg
 
-cfg.epochs           = 3
+cfg.epochs           = 6
 cfg.crop_sizes       = [512]                          # 只用最小 crop
 cfg.batch_size       = 2
 cfg.grad_accum_steps = 2
 cfg.num_workers      = 0                              # Windows 上 0 最快
 cfg.amp              = False
-cfg.encoder          = 'timm-efficientnet-b1'          # 轻量编码器, 速度 3x
+cfg.encoder          = 'resnet18'          # 轻量编码器, 速度 3x
 cfg.infer_crop       = 512                            # 验证/推理用 crop, 与训练一致
 cfg.infer_overlap    = 128
 cfg.tta_scales       = [1.0]                     # 快速验证: 只用原图, 不加多尺度
@@ -77,7 +77,7 @@ def evaluate_sliding(model, loader, device, metric):
                     model, single_img, crop_size=cfg.infer_crop,
                     overlap=cfg.infer_overlap, device=device,
                     tta=False, num_classes=cfg.num_classes,
-                    has_cls=True, scales=[1.0])
+                    has_cls=False, scales=[1.0])
                 pred = torch.from_numpy(prob.argmax(axis=2)).unsqueeze(0).to(device)
                 metric.update(pred, masks[i:i+1])
     return metric.compute()
@@ -95,7 +95,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, ema):
     for step, (imgs, masks) in enumerate(pbar):
         imgs  = imgs.to(device)
         masks = masks.to(device)
-        seg_logits, cls_logits = model(imgs)
+        seg_logits = model(imgs)
+        cls_logits = None
         cls_target = (masks.unsqueeze(1) == torch.tensor([1,2,3], device=device).view(1,3,1,1)).any(dim=(2,3)).float()
         loss = criterion(seg_logits, cls_logits, masks, cls_target) / accum
         loss.backward()
@@ -150,7 +151,7 @@ def main():
     # ==== 2. 模型 + 损失 + 优化器 ====
     print('\n[2/5] Building model ...')
     model = build_model().to(device)
-    criterion = CombinedLoss()
+    criterion = CombinedLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                   weight_decay=cfg.weight_decay)
     scheduler = get_lr_scheduler(optimizer, cfg.epochs, cfg.warmup_epochs)

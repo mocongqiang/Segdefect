@@ -24,7 +24,7 @@ from data import get_split, DefectDataset, DefectBank, make_sampler, collate_fn
 from model import build_model
 from losses import CombinedLoss
 from metrics import IoUMetric
-from utils import set_seed, EMA, get_lr_scheduler
+from utils import set_seed, EMA, get_lr_scheduler, sliding_window_inference
 from logger import TrainLogger
 
 
@@ -40,17 +40,36 @@ def make_cls_target(masks):
     return targets
 
 
-def evaluate(model, loader, device, metric):
-    """验证：模型返回 (seg_logits, cls_logits)，只用 seg_logits 计算 mIoU。"""
+def evaluate(model, loader, device, metric, use_sliding=False):
+    """验证：模型返回 (seg_logits, cls_logits)，只用 seg_logits 计算 mIoU。
+
+    Args:
+        use_sliding: 是否使用滑窗推理（与推理阶段一致，更准确但更慢）
+    """
     model.eval()
     metric.reset()
     with torch.no_grad():
         for imgs, masks in tqdm(loader, desc='Val', leave=False):
-            imgs  = imgs.to(device)
             masks = masks.to(device)
-            seg_logits, _ = model(imgs)
-            pred = seg_logits.argmax(dim=1)
-            metric.update(pred, masks)
+            if use_sliding:
+                # 滑窗推理：逐张处理，与推理阶段一致
+                for i in range(imgs.size(0)):
+                    single_img = imgs[i:i+1].to(device)
+                    prob = sliding_window_inference(
+                        model, single_img,
+                        crop_size=cfg.infer_crop,
+                        overlap=cfg.infer_overlap,
+                        device=device, tta=False,
+                        num_classes=cfg.num_classes,
+                        has_cls=False, scales=[1.0])
+                    pred = torch.from_numpy(prob.argmax(axis=2)).unsqueeze(0).to(device)
+                    metric.update(pred, masks[i:i+1])
+            else:
+                # 直接推理：快速但可能低估 mIoU
+                imgs = imgs.to(device)
+                seg_logits = model(imgs)
+                pred = seg_logits.argmax(dim=1)
+                metric.update(pred, masks)
     return metric.compute()
 
 
@@ -69,7 +88,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler,
         masks = masks.to(device, non_blocking=True)
 
         with autocast('cuda', enabled=cfg.amp):
-            seg_logits, cls_logits = model(imgs)
+            seg_logits = model(imgs)
+            cls_logits = None
             cls_target = make_cls_target(masks)
             loss = criterion(seg_logits, cls_logits, masks, cls_target) / accum_steps
 
@@ -119,7 +139,7 @@ def main():
                               sampler=sampler, num_workers=cfg.num_workers,
                               pin_memory=True, drop_last=True,
                               collate_fn=collate_fn)
-    val_loader   = DataLoader(val_ds, batch_size=2,
+    val_loader   = DataLoader(val_ds, batch_size=4,
                               shuffle=False, num_workers=cfg.num_workers,
                               pin_memory=True,
                               collate_fn=collate_fn)
@@ -128,7 +148,7 @@ def main():
     model = build_model().to(device)
 
     # ---------- 损失 / 优化器 / 调度器 ----------
-    criterion = CombinedLoss()
+    criterion = CombinedLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                   weight_decay=cfg.weight_decay)
     scheduler = get_lr_scheduler(optimizer, cfg.epochs, cfg.warmup_epochs)
@@ -186,7 +206,6 @@ def main():
         # 训练
         avg_loss = train_one_epoch(model, train_loader, criterion,
                                    optimizer, scaler, device, epoch, ema)
-        scheduler.step()
 
         # 用 EMA 权重验证
         backup = {k: v.clone() for k, v in model.state_dict().items()}
@@ -200,6 +219,9 @@ def main():
         current_lr = scheduler.get_last_lr()[0]
         logger.log_epoch(epoch, avg_loss, iou_dict, val_miou, current_lr)
 
+        # 学习率调度（验证后执行，日志中的 lr 是当前 epoch 的值）
+        scheduler.step()
+
         # 保存最佳模型
         if val_miou > best_miou + cfg.early_stop_min_delta:
             best_miou = val_miou
@@ -208,7 +230,13 @@ def main():
             torch.save({
                 'epoch': epoch,
                 'model_state': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
+                'ema_shadow': copy.deepcopy(ema.shadow),
                 'val_miou': val_miou,
+                'best_miou': best_miou,
+                'best_epoch': best_epoch,
+                'early_stop_counter': early_stop_counter,
             }, os.path.join(cfg.ckpt_dir, 'best.pth'))
             print(f'  ★ Best mIoU: {best_miou:.4f}, saved.')
         else:
