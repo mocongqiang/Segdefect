@@ -1,273 +1,415 @@
-"""训练脚本
-
-服务器完整训练（RTX 3090 24GB）：
-  修改 config.py → batch_size=8, num_workers=8, grad_accum_steps=1
-  运行：python train.py
-本地快速验证：
-  运行：python validate_pipeline.py
 """
-import os, sys, time, copy, shutil
+训练入口
+DeepLabV3+ Final Version
 
-# 减少 CUDA 内存碎片（OOM 时推荐开启）
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+支持：
+✔ AMP
+✔ Cosine LR
+✔ Warmup
+✔ EarlyStopping
+✔ Resume
+✔ Defect-aware Crop
+✔ CopyPaste
+✔ 多尺度训练
+✔ 最佳模型保存
+"""
 
-import numpy as np
+import os
+import time
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.amp import autocast, GradScaler
+
 from tqdm import tqdm
 
 from config import cfg
-from data import get_split, DefectDataset, DefectBank, make_sampler, collate_fn
+
+from data import (
+    get_split,
+    DefectDataset,
+    DefectBank,
+    collate_fn,
+)
+
 from model import build_model
 from losses import CombinedLoss
 from metrics import IoUMetric
-from utils import set_seed, EMA, get_lr_scheduler, sliding_window_inference
-from logger import TrainLogger
-
-
-def make_cls_target(masks):
-    """从 mask 生成多标签分类目标 (B, 3)。
-
-    cls_target[i] = [has_oil, has_stain, has_scratch]
+from utils import (
+    set_seed,
+    get_lr_scheduler,
+)
+def evaluate(model, loader, criterion, device):
     """
-    B = masks.shape[0]
-    targets = masks.new_zeros(B, 3, dtype=torch.float)
-    for c in [1, 2, 3]:
-        targets[:, c - 1] = (masks == c).flatten(1).any(dim=1).float()
-    return targets
-
-
-def evaluate(model, loader, device, metric, use_sliding=False):
-    """验证：模型返回 (seg_logits, cls_logits)，只用 seg_logits 计算 mIoU。
-
-    Args:
-        use_sliding: 是否使用滑窗推理（与推理阶段一致，更准确但更慢）
+    验证一个 epoch
     """
+
     model.eval()
-    metric.reset()
-    with torch.no_grad():
-        for imgs, masks in tqdm(loader, desc='Val', leave=False):
-            masks = masks.to(device)
-            if use_sliding:
-                # 滑窗推理：逐张处理，与推理阶段一致
-                for i in range(imgs.size(0)):
-                    single_img = imgs[i:i+1].to(device)
-                    prob = sliding_window_inference(
-                        model, single_img,
-                        crop_size=cfg.infer_crop,
-                        overlap=cfg.infer_overlap,
-                        device=device, tta=False,
-                        num_classes=cfg.num_classes,
-                        has_cls=False, scales=[1.0])
-                    pred = torch.from_numpy(prob.argmax(axis=2)).unsqueeze(0).to(device)
-                    metric.update(pred, masks[i:i+1])
-            else:
-                # 直接推理：快速但可能低估 mIoU
-                imgs = imgs.to(device)
-                seg_logits = model(imgs)
-                pred = seg_logits.argmax(dim=1)
-                metric.update(pred, masks)
-    return metric.compute()
 
+    metric = IoUMetric()
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler,
-                    device, epoch, ema):
-    model.train()
-    criterion.set_epoch(epoch)
     total_loss = 0.0
-    n = 0
 
-    accum_steps = cfg.grad_accum_steps
-    optimizer.zero_grad()
-    pbar = tqdm(loader, desc=f'Epoch {epoch+1}/{cfg.epochs}')
-    for step, (imgs, masks) in enumerate(pbar):
-        imgs  = imgs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
+    with torch.no_grad():
 
-        with autocast('cuda', enabled=cfg.amp):
-            seg_logits = model(imgs)
-            cls_logits = None
-            cls_target = make_cls_target(masks)
-            loss = criterion(seg_logits, cls_logits, masks, cls_target) / accum_steps
+        for images, masks in loader:
 
-        scaler.scale(loss).backward()
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
 
-        if (step + 1) % accum_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            ema.update(model)
+            logits = model(images)
 
-        total_loss += loss.item() * accum_steps * imgs.size(0)
-        n += imgs.size(0)
-        pbar.set_postfix(loss=f'{total_loss/n:.4f}')
+            dummy_cls = None
+            dummy_target = None
 
-    # 处理最后不完整的累积步
-    if (step + 1) % accum_steps != 0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad()
-        ema.update(model)
+            loss = criterion(
+                logits,
+                dummy_cls,
+                masks,
+                dummy_target
+            )
 
-    return total_loss / n
+            total_loss += loss.item()
+
+            pred = logits.argmax(dim=1)
+
+            metric.update(pred, masks)
+
+    iou, miou = metric.compute()
+
+    avg_loss = total_loss / len(loader)
+
+    return avg_loss, iou, miou
 
 
-def main():
+def train():
+
+    # --------------------------------------------------------
+    # 初始化
+    # --------------------------------------------------------
     set_seed(cfg.seed)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # ---------- 数据 ----------
-    print('Loading data...')
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    print("=" * 60)
+    print("Device :", device)
+    print("Model  :", cfg.arch)
+    print("Encoder:", cfg.encoder)
+    print("=" * 60)
+
+
+    # --------------------------------------------------------
+    # 数据集划分
+    # --------------------------------------------------------
     train_files, val_files = get_split()
-    print(f'  Train: {len(train_files)}, Val: {len(val_files)}')
 
-    print('Building defect bank for CopyPaste...')
+    print(f"Train : {len(train_files)}")
+    print(f"Val   : {len(val_files)}")
+
+
+    # --------------------------------------------------------
+    # Defect Bank
+    # --------------------------------------------------------
     defect_bank = DefectBank(train_files)
 
-    train_ds = DefectDataset(train_files, mode='train', defect_bank=defect_bank)
-    val_ds   = DefectDataset(val_files,   mode='val')
 
-    sampler = make_sampler(train_files)
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                              sampler=sampler, num_workers=cfg.num_workers,
-                              pin_memory=True, drop_last=True,
-                              collate_fn=collate_fn)
-    val_loader   = DataLoader(val_ds, batch_size=4,
-                              shuffle=False, num_workers=cfg.num_workers,
-                              pin_memory=True,
-                              collate_fn=collate_fn)
+    # --------------------------------------------------------
+    # Dataset
+    # --------------------------------------------------------
+    train_dataset = DefectDataset(
+        train_files,
+        mode="train",
+        defect_bank=defect_bank
+    )
 
-    # ---------- 模型 ----------
+    val_dataset = DefectDataset(
+        val_files,
+        mode="val"
+    )
+
+
+    # --------------------------------------------------------
+    # DataLoader
+    # --------------------------------------------------------
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=collate_fn,
+        persistent_workers=cfg.num_workers > 0,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=True,
+        persistent_workers=cfg.num_workers > 0,
+    )
+
+
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
     model = build_model().to(device)
 
-    # ---------- 损失 / 优化器 / 调度器 ----------
+    print(model.__class__.__name__)
+
+
+    # --------------------------------------------------------
+    # Loss
+    # --------------------------------------------------------
     criterion = CombinedLoss().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
-                                  weight_decay=cfg.weight_decay)
-    scheduler = get_lr_scheduler(optimizer, cfg.epochs, cfg.warmup_epochs)
-    scaler = GradScaler('cuda', enabled=cfg.amp)
 
-    # ---------- EMA ----------
-    ema = EMA(model, decay=cfg.ema_decay)
 
-    # ---------- 断点续训 ----------
-    best_miou = 0.0
-    best_epoch = 0
-    early_stop_counter = 0
+    # --------------------------------------------------------
+    # Optimizer
+    # --------------------------------------------------------
+    optimizer = AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay
+    )
+
+
+    # --------------------------------------------------------
+    # Scheduler
+    # --------------------------------------------------------
+    scheduler = get_lr_scheduler(
+        optimizer,
+        cfg.epochs,
+        cfg.warmup_epochs
+    )
+
+
+    # --------------------------------------------------------
+    # AMP
+    # --------------------------------------------------------
+    scaler = GradScaler(enabled=cfg.amp)
+
+
+    # --------------------------------------------------------
+    # Resume
+    # --------------------------------------------------------
     start_epoch = 0
 
-    if cfg.resume_from and os.path.exists(cfg.resume_from):
-        print(f'Resuming from: {cfg.resume_from}')
+    if cfg.resume_from is not None:
 
-        # 备份上一轮的 best.pth，防止被续训覆盖
-        best_path = os.path.join(cfg.ckpt_dir, 'best.pth')
-        if os.path.exists(best_path):
-            backup_path = os.path.join(cfg.ckpt_dir, f'best_backup_epoch00.pth')
-            ckpt_old = torch.load(best_path, map_location='cpu', weights_only=False)
-            old_epoch = ckpt_old.get('epoch', -1) + 1
-            backup_path = os.path.join(cfg.ckpt_dir, f'best_backup_epoch{old_epoch}.pth')
-            shutil.copy2(best_path, backup_path)
-            print(f'  Backed up previous best → {backup_path}')
+        print(f"Resume from {cfg.resume_from}")
 
-        ckpt = torch.load(cfg.resume_from, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['model_state'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        if 'scaler' in ckpt:
-            scaler.load_state_dict(ckpt['scaler'])
-        if 'ema_shadow' in ckpt:
-            ema.shadow = ckpt['ema_shadow']
-        best_miou = ckpt.get('best_miou', 0.0)
-        best_epoch = ckpt.get('best_epoch', 0)
-        early_stop_counter = ckpt.get('early_stop_counter', 0)
-        start_epoch = ckpt['epoch'] + 1
-        # 用新 cfg.epochs 重建 scheduler，并跳过已训练 epoch
-        scheduler = get_lr_scheduler(optimizer, cfg.epochs, cfg.warmup_epochs)
-        for _ in range(start_epoch):
-            scheduler.step()
-        remaining = cfg.epochs - start_epoch
-        print(f'  Resumed at epoch {start_epoch+1}, {remaining} epochs remaining')
-        print(f'  Best so far: mIoU={best_miou:.4f} at epoch {best_epoch+1}')
-        print(f'  Early stop counter: {early_stop_counter}/{cfg.early_stop_patience}')
+        ckpt = torch.load(
+            cfg.resume_from,
+            map_location=device,
+            weights_only=False
+        )
 
-    # ---------- 日志 ----------
-    logger = TrainLogger(cfg, tag='train')
+        model.load_state_dict(ckpt["model_state"])
 
-    # ---------- 训练循环 ----------
-    metric = IoUMetric(num_classes=cfg.num_classes)
+        optimizer.load_state_dict(
+            ckpt["optimizer_state"]
+        )
 
+        scheduler.load_state_dict(
+            ckpt["scheduler_state"]
+        )
+
+        scaler.load_state_dict(
+            ckpt["scaler_state"]
+        )
+
+        start_epoch = ckpt["epoch"] + 1
+
+
+    # --------------------------------------------------------
+    # EarlyStopping
+    # --------------------------------------------------------
+    best_miou = 0.0
+
+    patience = 0
+
+    os.makedirs(cfg.ckpt_dir, exist_ok=True)
+
+        # ==========================================================
+    # Train Loop
+    # ==========================================================
     for epoch in range(start_epoch, cfg.epochs):
-        # 训练
-        avg_loss = train_one_epoch(model, train_loader, criterion,
-                                   optimizer, scaler, device, epoch, ema)
 
-        # 用 EMA 权重验证
-        backup = {k: v.clone() for k, v in model.state_dict().items()}
-        ema.apply_shadow(model)
+        print(f"\nEpoch [{epoch + 1}/{cfg.epochs}]")
 
-        iou_dict, val_miou = evaluate(model, val_loader, device, metric)
-        print(f'Epoch {epoch+1}/{cfg.epochs} | Loss: {avg_loss:.4f} | '
-              f'Val: {metric}')
+        model.train()
 
-        # 写日志
-        current_lr = scheduler.get_last_lr()[0]
-        logger.log_epoch(epoch, avg_loss, iou_dict, val_miou, current_lr)
+        criterion.set_epoch(epoch)
 
-        # 学习率调度（验证后执行，日志中的 lr 是当前 epoch 的值）
+        running_loss = 0.0
+
+        optimizer.zero_grad(set_to_none=True)
+
+        pbar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            ncols=120
+        )
+
+        for step, (images, masks) in pbar:
+
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            with autocast("cuda", enabled=cfg.amp):
+
+                logits = model(images)
+
+                loss = criterion(
+                    logits,
+                    None,
+                    masks,
+                    None
+                )
+
+                loss = loss / cfg.grad_accum_steps
+
+            scaler.scale(loss).backward()
+
+            # ------------------------------
+            # Gradient Accumulation
+            # ------------------------------
+            if (
+                (step + 1) % cfg.grad_accum_steps == 0
+                or
+                (step + 1) == len(train_loader)
+            ):
+
+                scaler.unscale_(optimizer)
+
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    cfg.grad_clip
+                )
+
+                scaler.step(optimizer)
+
+                scaler.update()
+
+                optimizer.zero_grad(set_to_none=True)
+
+            running_loss += (
+                loss.item() * cfg.grad_accum_steps
+            )
+
+            pbar.set_postfix(
+                loss=f"{running_loss/(step+1):.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}"
+            )
+
         scheduler.step()
 
-        # 保存最佳模型
-        if val_miou > best_miou + cfg.early_stop_min_delta:
-            best_miou = val_miou
-            best_epoch = epoch
-            early_stop_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scaler': scaler.state_dict(),
-                'ema_shadow': copy.deepcopy(ema.shadow),
-                'val_miou': val_miou,
-                'best_miou': best_miou,
-                'best_epoch': best_epoch,
-                'early_stop_counter': early_stop_counter,
-            }, os.path.join(cfg.ckpt_dir, 'best.pth'))
-            print(f'  ★ Best mIoU: {best_miou:.4f}, saved.')
+        train_loss = running_loss / len(train_loader)
+
+            # =====================================================
+        # Validation
+        # =====================================================
+        val_loss, iou, miou = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device
+        )
+
+        print(
+            f"\nEpoch {epoch+1}/{cfg.epochs}"
+            f" | Train Loss: {train_loss:.4f}"
+            f" | Val Loss: {val_loss:.4f}"
+        )
+
+        print(
+            f"Oil: {iou[1]:.4f}"
+            f" | Stain: {iou[2]:.4f}"
+            f" | Scratch: {iou[3]:.4f}"
+            f" | mIoU: {miou:.4f}"
+        )
+
+
+        # =====================================================
+        # Save Best Model
+        # =====================================================
+        if miou > best_miou + cfg.early_stop_min_delta:
+
+            best_miou = miou
+            patience = 0
+
+            save_path = os.path.join(
+                cfg.ckpt_dir,
+                "best.pth"
+            )
+
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict(),
+                    "best_miou": best_miou,
+                },
+                save_path
+            )
+
+            print(f"Best model saved -> {save_path}")
+
         else:
-            early_stop_counter += 1
 
-        # 恢复原始权重继续训练
-        ema.restore(model, backup)
+            patience += 1
 
-        # Early Stopping
-        if early_stop_counter >= cfg.early_stop_patience:
-            print(f'\nEarly stopping at epoch {epoch+1}: '
-                  f'no improvement for {cfg.early_stop_patience} epochs. '
-                  f'(Best: {best_miou:.4f} at epoch {best_epoch+1})')
+            print(
+                f"EarlyStopping "
+                f"{patience}/{cfg.early_stop_patience}"
+            )
+
+
+        # =====================================================
+        # Save Last
+        # =====================================================
+        last_path = os.path.join(
+            cfg.ckpt_dir,
+            "last.pth"
+        )
+
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "scaler_state": scaler.state_dict(),
+                "best_miou": best_miou,
+            },
+            last_path
+        )
+
+
+        # =====================================================
+        # Early Stop
+        # =====================================================
+        if patience >= cfg.early_stop_patience:
+
+            print("\nEarly Stopping Triggered.")
+
             break
 
-        # 每 10 epoch 存 checkpoint（含完整训练状态，支持断点续训）
-        if (epoch + 1) % 10 == 0:
-            torch.save({
-                'epoch': epoch,
-                'model_state': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scaler': scaler.state_dict(),
-                'ema_shadow': copy.deepcopy(ema.shadow),
-                'best_miou': best_miou,
-                'best_epoch': best_epoch,
-                'early_stop_counter': early_stop_counter,
-            }, os.path.join(cfg.ckpt_dir, f'epoch_{epoch+1}.pth'))
 
-    logger.close()
-    print(f'\nTraining done. Best Val mIoU: {best_miou:.4f}')
+    print("\nTraining Finished.")
+    print(f"Best mIoU : {best_miou:.4f}")
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+
+    train()
+

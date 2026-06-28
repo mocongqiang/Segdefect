@@ -19,6 +19,7 @@ pay/
 *.csv
 *.json
 log.txt
+log2.txt
 tra.py
 
 # OS

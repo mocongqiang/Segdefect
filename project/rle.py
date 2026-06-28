@@ -1,4 +1,4 @@
-"""RLE 编解码 (行优先, 1-indexed)"""
+"""RLE 编解码 (Kaggle 标准: F-order 列优先, 1-indexed)"""
 import os
 import numpy as np
 from config import cfg
@@ -16,21 +16,14 @@ def encode_rle(binary_mask):
     if mask.sum() == 0:
         return '0 0'
 
-    # 行优先 flatten
+    # Kaggle 标准：F-order flatten + compact encoding
     pixels = mask.flatten(order=cfg.rle_order)
-    # 前后补 0 以捕获首尾的 run
     pixels = np.concatenate([[0], pixels, [0]])
-    # 找到变化点
-    diffs = np.where(pixels[1:] != pixels[:-1])[0]
-    # 转为 1-indexed 起点
-    starts = diffs[::2] + cfg.rle_index_start
-    ends   = diffs[1::2] + cfg.rle_index_start
-    lengths = ends - starts
 
-    parts = []
-    for s, l in zip(starts, lengths):
-        parts.append(f'{s} {l}')
-    return ' '.join(parts)
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + cfg.rle_index_start
+    runs[1::2] -= runs[::2]
+
+    return ' '.join(map(str, runs))
 
 
 def decode_rle(rle_str, shape):

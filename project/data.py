@@ -4,7 +4,7 @@ import numpy as np
 import cv2
 from PIL import Image
 import torch
-from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from config import cfg
@@ -53,6 +53,115 @@ def load_image(path):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
+def defect_aware_crop(
+    image,
+    mask,
+    crop_size,
+    defect_prob=0.8,
+):
+    """
+    优先裁剪包含缺陷区域。
+
+    80%概率：
+        裁剪中心落在缺陷附近
+
+    20%概率：
+        完全随机裁剪
+    """
+
+    H, W = mask.shape
+
+    # -----------------------------
+    # 随机裁剪
+    # -----------------------------
+    if random.random() < (1 - defect_prob):
+
+        x = random.randint(
+            0,
+            max(0, W - crop_size)
+        )
+
+        y = random.randint(
+            0,
+            max(0, H - crop_size)
+        )
+
+        return (
+            image[y:y+crop_size,
+                  x:x+crop_size],
+            mask[y:y+crop_size,
+                 x:x+crop_size]
+        )
+
+    # -----------------------------
+    # 找所有缺陷像素
+    # -----------------------------
+    ys, xs = np.where(mask > 0)
+
+    if len(xs) == 0:
+
+        x = random.randint(
+            0,
+            max(0, W - crop_size)
+        )
+
+        y = random.randint(
+            0,
+            max(0, H - crop_size)
+        )
+
+        return (
+            image[y:y+crop_size,
+                  x:x+crop_size],
+            mask[y:y+crop_size,
+                 x:x+crop_size]
+        )
+
+    # -----------------------------
+    # 随机选择一个缺陷像素
+    # -----------------------------
+    idx = random.randint(
+        0,
+        len(xs)-1
+    )
+
+    cx = xs[idx]
+
+    cy = ys[idx]
+
+    # -----------------------------
+    # 加一点随机偏移
+    # -----------------------------
+    cx += random.randint(-64,64)
+
+    cy += random.randint(-64,64)
+
+    x1 = np.clip(
+        cx-crop_size//2,
+        0,
+        W-crop_size
+    )
+
+    y1 = np.clip(
+        cy-crop_size//2,
+        0,
+        H-crop_size
+    )
+
+    return (
+
+        image[
+            y1:y1+crop_size,
+            x1:x1+crop_size
+        ],
+
+        mask[
+            y1:y1+crop_size,
+            x1:x1+crop_size
+        ]
+
+    )
+
 # ------------------------------------------------------------------
 #  数据划分
 # ------------------------------------------------------------------
@@ -86,11 +195,14 @@ def get_sample_weights(files):
         if 2 in unique:     # Stain 极少 → 大幅加权
             w *= 5.0
         if 3 in unique:     # Scratch
-            w *= 2.0
+            w *= 5.0
         if 1 in unique:     # Oil
             w *= 1.5
         weights.append(w)
     return weights
+
+
+
 
 
 # ------------------------------------------------------------------
@@ -121,13 +233,13 @@ class DefectBank:
 
     def paste(self, img, mask):
         """随机选一个缺陷块贴到 img/mask 上。"""
-        # 优先选 Stain (cls=2)
+        # 优先选 Scratch (cls=3)，因为最难学
         cls_pool = []
         r = random.random()
-        if r < 0.5 and len(self.bank[2]) > 0:
-            cls_pool = self.bank[2]
-        elif r < 0.8 and len(self.bank[3]) > 0:
+        if r < 0.5 and len(self.bank[3]) > 0:
             cls_pool = self.bank[3]
+        elif r < 0.8 and len(self.bank[2]) > 0:
+            cls_pool = self.bank[2]
         else:
             all_items = []
             for c in [1, 2, 3]:
@@ -184,37 +296,96 @@ class DefectBank:
 #  数据增强
 # ------------------------------------------------------------------
 def get_train_transform(crop_size):
-    return A.Compose([
-        A.RandomScale(scale_limit=(-0.3, 0.5), p=0.5),
-        A.PadIfNeeded(min_height=crop_size, min_width=crop_size,
-                      border_mode=cv2.BORDER_CONSTANT, fill=0, fill_mask=0),
-        A.RandomCrop(height=crop_size, width=crop_size, p=1.0),
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        A.RandomRotate90(p=0.5),
-        A.OneOf([
-            A.ElasticTransform(p=1.0),
-            A.GridDistortion(p=1.0),
-            A.OpticalDistortion(distort_limit=0.05, p=1.0),
-        ], p=0.3),
-        A.OneOf([
-            A.GaussNoise(p=1.0),
-            A.ISONoise(p=1.0),
-        ], p=0.3),
-        A.OneOf([
-            A.GaussianBlur(blur_limit=(3, 5), p=1.0),
-            A.MotionBlur(blur_limit=3, p=1.0),
-            A.MedianBlur(blur_limit=3, p=1.0),
-        ], p=0.2),
-        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.03, p=0.5),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
-        A.CoarseDropout(num_holes_range=(2, 8),
-                        hole_height_range=(16, 64),
-                        hole_width_range=(16, 64), p=0.3),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ], additional_targets={'mask': 'mask'})
+    """
+    训练增强（注意：这里已经不负责 RandomCrop）
 
+    crop 已经由 defect_aware_crop 完成，
+    transform 这里只负责几何增强、颜色增强、噪声增强。
+    """
+
+    return A.Compose([
+
+        # -------------------------
+        # 几何增强
+        # -------------------------
+        A.HorizontalFlip(p=0.5),
+
+        A.VerticalFlip(p=0.5),
+
+        A.RandomRotate90(p=0.5),
+
+        A.ShiftScaleRotate(
+            shift_limit=0.05,
+            scale_limit=0.10,
+            rotate_limit=10,
+            border_mode=cv2.BORDER_CONSTANT,
+            p=0.5
+        ),
+
+        # -------------------------
+        # Elastic
+        # -------------------------
+        A.OneOf([
+            A.ElasticTransform(alpha=30, sigma=5),
+            A.GridDistortion(),
+            A.OpticalDistortion(distort_limit=0.03),
+        ], p=0.2),
+
+        # -------------------------
+        # Noise
+        # -------------------------
+        A.OneOf([
+            A.GaussNoise(),
+            A.ISONoise(),
+        ], p=0.25),
+
+        # -------------------------
+        # Blur
+        # -------------------------
+        A.OneOf([
+            A.GaussianBlur(blur_limit=3),
+            A.MotionBlur(blur_limit=3),
+            A.MedianBlur(blur_limit=3),
+        ], p=0.15),
+
+        # -------------------------
+        # Brightness
+        # -------------------------
+        A.ColorJitter(
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.10,
+            hue=0.03,
+            p=0.4
+        ),
+
+        A.RandomBrightnessContrast(
+            brightness_limit=0.15,
+            contrast_limit=0.15,
+            p=0.3
+        ),
+
+        # -------------------------
+        # Dropout
+        # -------------------------
+        A.CoarseDropout(
+            num_holes_range=(2,6),
+            hole_height_range=(16,48),
+            hole_width_range=(16,48),
+            p=0.2
+        ),
+
+        # -------------------------
+        # Normalize
+        # -------------------------
+        A.Normalize(
+            mean=[0.485,0.456,0.406],
+            std=[0.229,0.224,0.225]
+        ),
+
+        ToTensorV2()
+
+    ])
 
 def _pad_to_divisor(img, mask=None, divisor=32, return_pad=False):
     """将图像 (和 mask) pad 到 divisor 的倍数 (右下侧补零)。
@@ -285,10 +456,28 @@ class DefectDataset(Dataset):
 
             # 随机选 crop 尺寸
             cs = random.choice(cfg.crop_sizes)
-            augmented = self.transforms[cs](image=img, mask=mask)
-            img_t = augmented['image']
-            mask_t = augmented['mask'].long()
-            return img_t, mask_t
+
+            img,mask = defect_aware_crop(
+
+                img,
+                mask,
+                crop_size=cs,
+                defect_prob=cfg.defect_crop_prob
+            )
+
+            augmented = self.transforms[cs](
+
+                image=img,
+
+                mask=mask,
+
+            )
+
+            img_t = augmented["image"]
+
+            mask_t = augmented["mask"].long()
+
+            return img_t,mask_t
 
         else:
             img, mask = _pad_to_divisor(img, mask, divisor=32)
@@ -319,9 +508,6 @@ class TestDataset(Dataset):
 # ------------------------------------------------------------------
 #  Sampler
 # ------------------------------------------------------------------
-def make_sampler(files):
-    weights = get_sample_weights(files)
-    return WeightedRandomSampler(weights, num_samples=len(files), replacement=True)
 
 
 # ------------------------------------------------------------------

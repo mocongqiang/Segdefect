@@ -10,7 +10,6 @@ from model import build_model
 from rle import generate_submission
 from utils import set_seed, sliding_window_inference
 
-
 def load_models(device, ensemble_ckpts=None):
     """加载模型（支持多 checkpoint 集成）。
 
@@ -90,6 +89,7 @@ def main():
     predictions = []
     names = []
 
+    print(f'Processing {len(test_files)} images (first image is slowest with full TTA)...')
     for path in tqdm(test_files, desc='Predicting'):
         name = os.path.basename(path)
         img = load_image(path)

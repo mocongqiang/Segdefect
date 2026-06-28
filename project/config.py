@@ -45,10 +45,10 @@ class Config:
     batch_size    = 4                 # 768²+B5 约需 12GB，4 安全
     num_workers   = 12                # 服务器 12 核
     grad_accum_steps = 2              # 有效 batch = 4×2 = 8
-    epochs        = 50                # 120→50（Epoch 28 已达最佳，50 留足缓冲）
+    epochs        = 60                # 120→50（Epoch 28 已达最佳，50 留足缓冲）
     lr            = 1e-4
     weight_decay  = 1e-4
-    warmup_epochs = 5
+    warmup_epochs = 3
     grad_clip     = 1.0
     amp           = True              # 同左
 
@@ -60,7 +60,7 @@ class Config:
 
     # 类别权重 (BG, Oil, Stain, Scratch)
     # BG 极低权重防止模型退化为全 BG 预测
-    class_weights = [0.0001, 1.0, 20.0, 10.0]
+    class_weights = [0.1, 1.0, 2.0, 3.0]
 
     # Early Stopping（Epoch 28 后持续过拟合，Loss 已失能）
     early_stop_patience = 15         # 15 epoch mIoU 不涨就停
@@ -75,6 +75,7 @@ class Config:
 
     # CopyPaste
     copypaste_prob = 0.5
+    defect_crop_prob = 0.8
 
     # ===================== 模型 =====================
     arch            = 'DeepLabV3Plus'
@@ -88,9 +89,23 @@ class Config:
     tta_flips     = True       # hflip + vflip
     tta_scales    = [0.75, 1.0, 1.25]  # 多尺度 TTA, 1.0=原图
 
+    # ===================== 后处理 =====================
+    # 类别概率阈值（低于阈值的像素不计为该类）
+    cls_thresholds = {1: 0.35,  # Oil
+                      2: 0.45,  # Stain（提高阈值减少误检）
+                      3: 0.35}  # Scratch
+
+    # 最小连通域面积（像素，小于此面积的区域被丢弃）
+    min_area = {1: 200,   # Oil: 大块区域
+                2: 50,    # Stain: 允许小块
+                3: 100}   # Scratch: 细长结构
+
+    # 孔洞填充（binary_fill_holes）
+    fill_holes = True
+
     # ===================== RLE =====================
     rle_index_start = 1        # 像素编号从 1 开始
-    rle_order       = 'C'      # 行优先 (row-major)
+    rle_order       = 'F'      # Kaggle 标准：列优先 (column-major / Fortran order)
 
 cfg = Config()
 
