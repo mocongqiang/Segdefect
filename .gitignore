@@ -10,6 +10,9 @@ __pycache__/
 # 数据集（torchvision 自动下载）
 data/
 pay/
+log/
+fdsnet-main/
+
 
 # 训练产物
 *.model
@@ -21,6 +24,7 @@ pay/
 log.txt
 log2.txt
 tra.py
+log[1-9].txt
 
 # OS
 .DS_Store
