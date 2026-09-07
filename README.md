@@ -55,7 +55,7 @@ Segdefect/
 │   ├── logs/                       # train_log.csv + config_snapshot.json
 │   └── submissions/                # submission.csv
 ├── README.md                       # 本文件
-└── 修改.md / 实验报告.md / 报告要求.md    # 课程报告 / 调参记录文档
+└── 修改.md                         # 调参记录文档
 ```
 
 ---
@@ -124,5 +124,5 @@ Lovasz 从 epoch 15 起线性 ramp（5 epoch），Boundary 从 epoch 10 起 ramp
 ## 7. 文档与历史
 
 - `project/README.md` —— 代码目录模块级说明（推荐开发时查阅）。
-- `修改.md` / `实验报告.md` / `报告要求.md` —— 调参过程记录与课程报告文档。
+- `修改.md` —— 调参过程记录与课程报告文档。
 - 瘦身清理说明：旧版文档 `PROJECT_STRUCTURE.md`、`log*.txt` / `train.log` / `log/` 目录及旧方案权重均已删除，仓库只保留最终版本代码与产物。
