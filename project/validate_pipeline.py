@@ -78,7 +78,7 @@ def evaluate_sliding(model, loader, device, metric):
                     overlap=cfg.infer_overlap, device=device,
                     tta=False, num_classes=cfg.num_classes,
                     has_cls=False, scales=[1.0])
-                pred = torch.from_numpy(prob.argmax(axis=2)).unsqueeze(0).to(device)
+                pred = prob.argmax(dim=2).unsqueeze(0).to(device)  # prob is now tensor
                 metric.update(pred, masks[i:i+1])
     return metric.compute()
 
@@ -221,8 +221,8 @@ def main():
             model, img_t, crop_size=cfg.infer_crop,
             overlap=cfg.infer_overlap, device=device,
             tta=cfg.tta_flips, num_classes=cfg.num_classes,
-            has_cls=True, scales=cfg.tta_scales)
-        predictions.append(prob.argmax(axis=2).astype(np.uint8))
+            has_cls=False, scales=cfg.tta_scales)
+        predictions.append(prob.cpu().numpy().argmax(axis=2).astype(np.uint8))  # prob is now tensor
         names.append(name)
 
     out_path = os.path.join(cfg.sub_dir, 'submission_validate.csv')

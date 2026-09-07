@@ -35,77 +35,127 @@ class Config:
     # 灰度映射 (RGB→Gray 后的值, 已验证)
     gray_map = {0: 0, 38: 1, 75: 2, 113: 3}
 
+
+    pseudo_threshold = 0.95
+
+    pseudo_img_dir = os.path.join(
+        data_root,
+        'train',
+        'pseudo_images'
+    )
+ # ===================== 伪标签 (Self-Training) 
+
+    pseudo_mask_dir = os.path.join(
+        data_root,
+        'train',
+        'pseudo_masks'
+    )
+
+    use_pseudo = True
+
+
     # ===================== 划分 =====================
     val_ratio = 0.15
     seed      = 42
 
     # ===================== 训练 =====================
     # ── 本地 (RTX 4050 6GB) ──   ── 服务器 (Linux, 大显存) ──
-    crop_sizes    = [512, 640, 768]   # 同左（多尺度随机裁剪）
-    batch_size    = 4                 # 768²+B5 约需 12GB，4 安全
-    num_workers   = 12                # 服务器 12 核
-    grad_accum_steps = 2              # 有效 batch = 4×2 = 8
-    epochs        = 60                # 120→50（Epoch 28 已达最佳，50 留足缓冲）
-    lr            = 1e-4
+    crop_sizes    = [768, 896]    # 保持 768/896 多尺度，兼顾显存和分辨率
+    batch_size    = 2                 
+    num_workers   = 8                
+    grad_accum_steps = 4              
+    epochs        = 20                
+    lr            = 5e-6          # 【修改1】提高学习率 2e-5 -> 3e-5，跳出局部最优
     weight_decay  = 1e-4
     warmup_epochs = 3
     grad_clip     = 1.0
-    amp           = True              # 同左
+    amp           = True              
 
     # 损失权重
-    w_focal  = 0.5
-    w_dice   = 0.5          # Dice 权重提高，对缺陷类更敏感
-    w_lovasz = 0.0          # 暂时禁用
-    w_cls = 0.0             # 暂时禁用分类头
+    # 【修改2】调整 Loss 比例，增加 Dice 和 Lovasz，降低 Focal 防止初期不稳
+    w_focal  = 0.35
+    w_dice   = 0.35          
+    w_lovasz = 0.10          
+    w_boundary = 0.20        
+    w_cls = 0.0            
+
+
+    # Dice Warmup: 关闭，从第 0 个 Epoch 就开始强力学
+    # 【修改3】关闭 Dice Warmup
+    dice_warmup_start = 0
+    dice_warmup_end = 0
 
     # 类别权重 (BG, Oil, Stain, Scratch)
-    # BG 极低权重防止模型退化为全 BG 预测
-    class_weights = [0.1, 1.0, 2.0, 3.0]
+    # 【修改4】极度放大稀有类别权重，打破模型只预测 Oil 的惰性
+    class_weights = [0.01, 2.0, 3.0, 2.0]  # Oil 提到 10.0
 
-    # Early Stopping（Epoch 28 后持续过拟合，Loss 已失能）
-    early_stop_patience = 15         # 15 epoch mIoU 不涨就停
+    # Early Stopping
+    early_stop_patience = 10         
     early_stop_min_delta = 0.001
 
     # EMA
-    ema_decay = 0.999
-
-    # 断点续训: 设为 checkpoint 路径, 如 '../output/checkpoints/epoch_20.pth'
-    # 留空或 None 表示从头训练
+    ema_decay = 0.996
+    
+    # 断点续训
+# resume_from = None?????????????????????????? best.pth?
+    # ????????resume_from = os.path.join(ckpt_dir, 'best.pth')
     resume_from = None
-
     # CopyPaste
-    copypaste_prob = 0.5
-    defect_crop_prob = 0.8
+    copypaste_prob = 0.8
+    defect_crop_prob = 1.0
 
     # ===================== 模型 =====================
-    arch            = 'DeepLabV3Plus'
-    encoder         = 'resnet50'
-    encoder_weights = 'imagenet'
+    arch            = 'Mask2Former'
+    encoder         = 'facebook/mask2former-swin-large-cityscapes-semantic'  
+    encoder_weights = 'imagenet'  
 
     # ===================== 推理 =====================
-    # 本地验证: 512/128, 服务器完整预测: 1024/256
-    infer_crop    = 1024              # validate_pipeline.py 会覆盖为 512
-    infer_overlap = 256               # validate_pipeline.py 会覆盖为 128
-    tta_flips     = True       # hflip + vflip
-    tta_scales    = [0.75, 1.0, 1.25]  # 多尺度 TTA, 1.0=原图
+    # 正方形推理，与训练 crop（768/896）保持一致的正方形分布
+    # 1024×1024 / 1152×1152 / 1280×1280
+    infer_sizes    = [1024, 1152, 1280]
+    infer_weights = [
+        1.0,
+        2.0,
+        1.0,
+    ]
+    tta_flips     = True
+
+    # 滑窗推理参数（伪标签生成 / validate_pipeline 用）
+    infer_crop     = 1024
+    infer_overlap  = 256
+    # 多尺度 TTA（滑窗推理用）
+    tta_scales     = [0.75, 1.0, 1.25, 1.5]
 
     # ===================== 后处理 =====================
-    # 类别概率阈值（低于阈值的像素不计为该类）
-    cls_thresholds = {1: 0.35,  # Oil
-                      2: 0.45,  # Stain（提高阈值减少误检）
-                      3: 0.35}  # Scratch
+    # cls_thresholds = {1: 0.65,  
+    #                   2: 0.55,  
+    #                   3: 0.50}  
 
-    # 最小连通域面积（像素，小于此面积的区域被丢弃）
-    min_area = {1: 200,   # Oil: 大块区域
-                2: 50,    # Stain: 允许小块
-                3: 100}   # Scratch: 细长结构
+    # min_area = {1: 150,   
+    #             2: 50,    
+    #             3: 80}  
+    cls_thresholds = None
 
-    # 孔洞填充（binary_fill_holes）
-    fill_holes = True
+    min_area = None  
+
+    fill_holes = False
 
     # ===================== RLE =====================
-    rle_index_start = 1        # 像素编号从 1 开始
-    rle_order       = 'F'      # Kaggle 标准：列优先 (column-major / Fortran order)
+    rle_index_start = 1        
+    rle_order       = 'F'      
+
+    # ===================== 集成 =====================
+    ensemble_models = [
+        {
+            'arch': 'Mask2Former',
+            'encoder': 'facebook/mask2former-swin-large-cityscapes-semantic',
+            'ckpt': os.path.join(
+                os.path.join(_root, 'output', 'checkpoints'),
+                'best.pth'
+            ),
+            'weight': 1.0,
+        },
+    ]
 
 cfg = Config()
 

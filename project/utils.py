@@ -1,4 +1,4 @@
-"""工具函数: 种子、EMA、学习率调度、滑窗推理"""
+"""工具函数: 种子、EMA、学习率调度、滑窗推理（优化版）"""
 import os, random, math
 import numpy as np
 import torch
@@ -51,7 +51,9 @@ def get_lr_scheduler(optimizer, epochs, warmup_epochs):
 def sliding_window_inference(model, image, crop_size, overlap, device,
                              tta=True, num_classes=4, has_cls=False,
                              scales=None):
-    """滑窗推理, 支持翻转 TTA + 多尺度 TTA。
+    """滑窗推理, 支持翻转 TTA + 多尺度 TTA（优化版）。
+
+    优化: AMP 推理 / 全 tensor 无 numpy 转换 / 批量 patch 推理
 
     Args:
         model: 分割模型 (如果 has_cls=True, 返回 (seg_logits, cls_logits))
@@ -65,7 +67,7 @@ def sliding_window_inference(model, image, crop_size, overlap, device,
         scales: list[float] | None, 多尺度因子, 如 [0.75, 1.0, 1.25], None 等价于 [1.0]
 
     Returns:
-        prob_map: (H, W, C) numpy array, softmax 概率
+        prob_map: (H, W, C) tensor on device, softmax 概率
     """
     scales = scales or [1.0]
     _, _, H, W = image.shape
@@ -81,35 +83,33 @@ def sliding_window_inference(model, image, crop_size, overlap, device,
             scaled_img = F.interpolate(image, size=(new_h, new_w),
                                        mode='bilinear', align_corners=False)
 
-        # ── 单尺度滑窗+翻转 TTA ──
+        # ── 单尺度滑窗+翻转 TTA（返回 tensor） ──
         prob_map_scaled = _single_scale_inference(
             model, scaled_img, crop_size, overlap, device,
             tta=tta, num_classes=num_classes, has_cls=has_cls,
-        )  # (scale_h, scale_w, C) numpy
+        )  # (scale_h, scale_w, C) tensor
 
-        # ── 缩回原图尺寸 ──
-        prob_t = torch.from_numpy(prob_map_scaled).permute(2, 0, 1).unsqueeze(0).to(device)  # (1,C,H_s,W_s)
+        # ── 缩回原图尺寸（全 tensor） ──
+        prob_t = prob_map_scaled.permute(2, 0, 1).unsqueeze(0)  # (1,C,Hs,Ws)
         prob_t = F.interpolate(prob_t, size=(H, W), mode='bilinear',
-                               align_corners=False)  # (1,C,H,W)
-        prob_t = prob_t[0].permute(1, 2, 0)  # (H,W,C)
+                               align_corners=False)[0].permute(1, 2, 0)  # (H,W,C)
         prob_sum += prob_t
         count_sum += 1.0
 
-    prob_map = (prob_sum / count_sum).cpu().numpy()   # (H,W,C)
-    return prob_map
+    return prob_sum / count_sum   # (H,W,C) tensor
 
 
 @torch.no_grad()
 def _single_scale_inference(model, image, crop_size, overlap, device,
                             tta=True, num_classes=4, has_cls=False):
-    """单尺度滑窗推理 (含翻转 TTA)。
+    """单尺度滑窗推理 (含翻转 TTA, 批量推理 + AMP)。
 
     Args:
         image: (1, 3, H, W) tensor
     其余参数同 sliding_window_inference。
 
     Returns:
-        prob_map: (H, W, C) numpy array
+        prob_map: (H, W, C) tensor on device
     """
     _, _, H, W = image.shape
     stride = crop_size - overlap
@@ -134,38 +134,51 @@ def _single_scale_inference(model, image, crop_size, overlap, device,
     if tta:
         flips += [(True, False), (False, True), (True, True)]
 
+    # 预收集所有 patch 位置信息
+    patches_info = []
     for hs in h_starts:
         for ws in w_starts:
             he = min(hs + crop_size, H)
             we = min(ws + crop_size, W)
-            ph = he - hs
-            pw = we - ws
+            ph, pw = he - hs, we - ws
+            patches_info.append((hs, he, ws, we, ph, pw))
 
-            patch = image[:, :, hs:he, ws:we]    # (1,3,ph,pw)
-            # padding to crop_size
-            if ph < crop_size or pw < crop_size:
-                patch = F.pad(patch, (0, crop_size - pw, 0, crop_size - ph),
-                              mode='reflect')
+    num_patches = len(patches_info)
 
-            for hflip, vflip in flips:
-                p = patch.clone()
+    # AMP 推理
+    amp_enabled = device.type == 'cuda'
+    with torch.amp.autocast('cuda', enabled=amp_enabled):
+        for hflip, vflip in flips:
+            # ── 批量收集所有 patch（无 clone，直接用 view + flip） ──
+            batch = torch.zeros(num_patches, 3, crop_size, crop_size,
+                                device=device)
+            for i, (hs, he, ws, we, ph, pw) in enumerate(patches_info):
+                patch = image[:, :, hs:he, ws:we]  # (1,3,ph,pw) view
+                if ph < crop_size or pw < crop_size:
+                    patch = F.pad(patch,
+                                  (0, crop_size - pw, 0, crop_size - ph),
+                                  mode='reflect')
                 if hflip:
-                    p = torch.flip(p, dims=[3])
+                    patch = torch.flip(patch, dims=[3])
                 if vflip:
-                    p = torch.flip(p, dims=[2])
+                    patch = torch.flip(patch, dims=[2])
+                batch[i] = patch[0]  # 去掉 batch 维
 
-                out = model(p)
-                seg_logits = out[0] if has_cls and isinstance(out, (tuple, list)) else out
-                prob = F.softmax(seg_logits, dim=1)   # (1,C,cs,cs)
+            # ── 批量推理 ──
+            out = model(batch)
+            seg_logits = out[0] if has_cls and isinstance(out, (tuple, list)) else out
+            probs = F.softmax(seg_logits, dim=1)  # (N,C,cs,cs)
 
-                if hflip:
-                    prob = torch.flip(prob, dims=[3])
-                if vflip:
-                    prob = torch.flip(prob, dims=[2])
+            # 翻转回去
+            if hflip:
+                probs = torch.flip(probs, dims=[3])
+            if vflip:
+                probs = torch.flip(probs, dims=[2])
 
-                prob = prob[0, :, :ph, :pw].permute(1, 2, 0)  # (ph,pw,C)
-                prob_sum[hs:he, ws:we] += prob
+            # ── 散射回 prob_sum ──
+            for i, (hs, he, ws, we, ph, pw) in enumerate(patches_info):
+                p = probs[i, :, :ph, :pw].permute(1, 2, 0)  # (ph,pw,C)
+                prob_sum[hs:he, ws:we] += p
                 count[hs:he, ws:we]    += 1
 
-    prob_map = (prob_sum / count).cpu().numpy()   # (H,W,C)
-    return prob_map
+    return prob_sum / count   # (H,W,C) tensor

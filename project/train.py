@@ -173,8 +173,10 @@ def train():
     # --------------------------------------------------------
     # Optimizer
     # --------------------------------------------------------
+    # 只优化 requires_grad=True 的参数（Mask2Former backbone 已冻结）
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = AdamW(
-        model.parameters(),
+        trainable_params,
         lr=cfg.lr,
         weight_decay=cfg.weight_decay
     )
@@ -290,7 +292,7 @@ def train():
                 scaler.unscale_(optimizer)
 
                 torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
+                    filter(lambda p: p.requires_grad and p.grad is not None, model.parameters()),
                     cfg.grad_clip
                 )
 

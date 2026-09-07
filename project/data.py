@@ -23,12 +23,23 @@ from config import cfg
 # ------------------------------------------------------------------
 #  Mask 加载
 # ------------------------------------------------------------------
-def load_mask(path):
-    """读取 mask 并转为 [0,1,2,3] 类别 ID。"""
+def load_mask(path, pseudo=False):
+    """读取 mask 并转为 [0,1,2,3] 类别 ID。
+
+    Args:
+        path: mask 文件路径
+        pseudo: 如果为 True，直接读取灰度值 (0/1/2/3/255)
+    """
     img = Image.open(path)
     if img.mode == 'P':
         img = img.convert('RGB')
     arr = np.array(img)
+
+    if pseudo or (arr.ndim == 2 and arr.max() <= 255 and set(np.unique(arr)).issubset({0, 1, 2, 3, 255})):
+        # 伪标签 mask：直接返回 (值域 0/1/2/3/255)
+        if arr.ndim == 3:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        return arr.astype(np.uint8)
 
     if arr.ndim == 3:
         # RGB 标注图
@@ -94,9 +105,9 @@ def defect_aware_crop(
         )
 
     # -----------------------------
-    # 找所有缺陷像素
+    # 找所有缺陷像素（排除 ignore=255）
     # -----------------------------
-    ys, xs = np.where(mask > 0)
+    ys, xs = np.where((mask > 0) & (mask != 255))
 
     if len(xs) == 0:
 
@@ -182,6 +193,21 @@ def get_split():
 
     train_files = [to_pair(all_imgs[i]) for i in train_idx]
     val_files   = [to_pair(all_imgs[i]) for i in val_idx]
+
+    # 混入伪标签数据
+    if cfg.use_pseudo and os.path.isdir(cfg.pseudo_img_dir):
+        pseudo_imgs = sorted(glob.glob(
+            os.path.join(cfg.pseudo_img_dir, '*.jpg')
+        ))
+        pseudo_pairs = []
+        for p in pseudo_imgs:
+            name = os.path.basename(p).replace('.jpg', '.png')
+            mp = os.path.join(cfg.pseudo_mask_dir, name)
+            if os.path.exists(mp):
+                pseudo_pairs.append((p, mp))
+        print(f'Pseudo-label data: {len(pseudo_pairs)} images')
+        train_files = train_files + pseudo_pairs
+
     return train_files, val_files
 
 
@@ -200,6 +226,17 @@ def get_sample_weights(files):
             w *= 1.5
         weights.append(w)
     return weights
+
+
+def make_sampler(files):
+    """根据缺陷类别出现频率构建 WeightedRandomSampler (Stain/Scratch 高权重)。"""
+    from torch.utils.data import WeightedRandomSampler
+    weights = get_sample_weights(files)
+    return WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True,
+    )
 
 
 
@@ -231,34 +268,30 @@ class DefectBank:
         for cls in [1, 2, 3]:
             print(f'  DefectBank class {cls}: {len(self.bank[cls])} patches')
 
-    def paste(self, img, mask):
-        """随机选一个缺陷块贴到 img/mask 上。"""
-        # 优先选 Scratch (cls=3)，因为最难学
-        cls_pool = []
-        r = random.random()
-        if r < 0.5 and len(self.bank[3]) > 0:
-            cls_pool = self.bank[3]
-        elif r < 0.8 and len(self.bank[2]) > 0:
-            cls_pool = self.bank[2]
-        else:
-            all_items = []
-            for c in [1, 2, 3]:
-                all_items.extend([(c, item) for item in self.bank[c]])
-            if not all_items:
-                return img, mask
-            cls, item = random.choice(all_items)
-            cls_pool = None
+    def _pick_one(self, force_cls=None):
+        """按权重随机选一个缺陷 (Oil 20%, Stain 50%, Scratch 30%)。
 
-        if cls_pool is not None:
-            item = random.choice(cls_pool)
-            # 根据采样的池子直接确定类别
-            if cls_pool is self.bank[2]:
-                cls = 2
-            elif cls_pool is self.bank[3]:
-                cls = 3
-            else:
-                cls = 1
+        Args:
+            force_cls: 如果指定，强制只从该类别中选
 
+        Returns:
+            (cls, item) 或 (None, None) 如果无可用缺陷
+        """
+        if force_cls is not None:
+            if len(self.bank[force_cls]) > 0:
+                return force_cls, random.choice(self.bank[force_cls])
+            return None, None
+
+        available = [(c, self.bank[c]) for c in [1, 2, 3] if len(self.bank[c]) > 0]
+        if not available:
+            return None, None
+        cls_weights = {1: 0.2, 2: 0.5, 3: 0.3}
+        weights = [cls_weights[c] for c, _ in available]
+        chosen_cls, chosen_bank = random.choices(available, weights=weights, k=1)[0]
+        return chosen_cls, random.choice(chosen_bank)
+
+    def _paste_item(self, img, mask, item, cls):
+        """将单个缺陷块贴到 img/mask 上（内部方法）。"""
         pimg  = item['img']
         pmask = item['mask']
         ph, pw = pimg.shape[:2]
@@ -289,6 +322,30 @@ class DefectBank:
         img[py:py+ph, px:px+pw] = roi_img.astype(np.uint8)
         mask[py:py+ph, px:px+pw] = np.where(pmask > 0, cls, roi_mask)
 
+        return img, mask
+
+    def paste(self, img, mask):
+        """随机贴一个缺陷块（按权重采样: Oil 20%, Stain 50%, Scratch 30%）。"""
+        cls, item = self._pick_one()
+        if cls is None:
+            return img, mask
+        return self._paste_item(img, mask, item, cls)
+
+    def paste_multi(self, img, mask):
+        """贴 2-4 个缺陷块，保证至少 1 个是 Stain(2) 或 Scratch(3)。"""
+        n = random.randint(2, 4)
+        for i in range(n):
+            if i == 0:
+                # 第一个强制选 Stain 或 Scratch
+                force_cls = random.choice([2, 3])
+                cls, item = self._pick_one(force_cls=force_cls)
+                if cls is None:
+                    cls, item = self._pick_one()  # fallback
+            else:
+                cls, item = self._pick_one()
+            if cls is None:
+                continue
+            img, mask = self._paste_item(img, mask, item, cls)
         return img, mask
 
 
@@ -447,12 +504,14 @@ class DefectDataset(Dataset):
     def __getitem__(self, idx):
         img_path, mask_path = self.files[idx]
         img  = load_image(img_path)
-        mask = load_mask(mask_path)
+        # 自动检测伪标签 mask（路径中包含 pseudo_masks）
+        is_pseudo = 'pseudo_masks' in mask_path
+        mask = load_mask(mask_path, pseudo=is_pseudo)
 
         if self.mode == 'train':
             # CopyPaste
             if self.defect_bank and random.random() < cfg.copypaste_prob:
-                img, mask = self.defect_bank.paste(img, mask)
+                img, mask = self.defect_bank.paste_multi(img, mask)
 
             # 随机选 crop 尺寸
             cs = random.choice(cfg.crop_sizes)

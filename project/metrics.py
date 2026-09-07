@@ -17,9 +17,13 @@ class IoUMetric:
 
     @torch.no_grad()
     def update(self, pred, target):
-        """pred, target: (B, H, W) int64."""
+        """pred, target: (B, H, W) int64. 忽略 target=255 的像素。"""
         pred   = pred.cpu().numpy().astype(np.int64)
         target = target.cpu().numpy().astype(np.int64)
+        # 排除 ignore_index=255 的像素
+        valid = (target != 255)
+        pred = pred[valid]
+        target = target[valid]
         for c in range(self.nc):
             p = pred == c
             t = target == c
